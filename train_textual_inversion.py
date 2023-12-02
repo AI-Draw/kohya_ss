@@ -7,6 +7,13 @@ import toml
 
 from tqdm import tqdm
 import torch
+try:
+    import intel_extension_for_pytorch as ipex
+    if torch.xpu.is_available():
+        from library.ipex import ipex_init
+        ipex_init()
+except Exception:
+    pass
 from accelerate.utils import set_seed
 from diffusers import DDPMScheduler
 from transformers import CLIPTokenizer
@@ -24,6 +31,8 @@ from library.custom_train_functions import (
     apply_snr_weight,
     prepare_scheduler_for_custom_training,
     scale_v_prediction_loss_like_noise_prediction,
+    add_v_prediction_like_loss,
+    apply_debiased_estimation,
 )
 
 imagenet_templates_small = [
@@ -82,6 +91,7 @@ imagenet_style_templates_small = [
 class TextualInversionTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
+        self.is_sdxl = False
 
     def assert_extra_args(self, args, train_dataset_group):
         pass
@@ -112,7 +122,7 @@ class TextualInversionTrainer:
             accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet, prompt_replacement
         )
 
-    def save_weights(self, file, updated_embs, save_dtype):
+    def save_weights(self, file, updated_embs, save_dtype, metadata):
         state_dict = {"emb_params": updated_embs[0]}
 
         if save_dtype is not None:
@@ -124,7 +134,7 @@ class TextualInversionTrainer:
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
 
-            save_file(state_dict, file)
+            save_file(state_dict, file, metadata)
         else:
             torch.save(state_dict, file)  # can be loaded in Web UI
 
@@ -303,8 +313,8 @@ class TextualInversionTrainer:
 
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
-        ds_for_collater = train_dataset_group if args.max_data_loader_n_workers == 0 else None
-        collater = train_util.collater_class(current_epoch, current_step, ds_for_collater)
+        ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
+        collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
 
         # make captions: tokenstring tokenstring1 tokenstring2 ...tokenstringn という文字列に書き換える超乱暴な実装
         if use_template:
@@ -344,7 +354,7 @@ class TextualInversionTrainer:
 
         # モデルに xformers とか memory efficient attention を組み込む
         train_util.replace_unet_modules(unet, args.mem_eff_attn, args.xformers, args.sdpa)
-        if torch.__version__ >= "2.0.0": # PyTorch 2.0.0 以上対応のxformersなら以下が使える
+        if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
         # 学習を準備する
@@ -380,7 +390,7 @@ class TextualInversionTrainer:
             train_dataset_group,
             batch_size=1,
             shuffle=True,
-            collate_fn=collater,
+            collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
         )
@@ -496,7 +506,9 @@ class TextualInversionTrainer:
             init_kwargs = {}
             if args.log_tracker_config is not None:
                 init_kwargs = toml.load(args.log_tracker_config)
-            accelerator.init_trackers("textual_inversion" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs)
+            accelerator.init_trackers(
+                "textual_inversion" if args.log_tracker_name is None else args.log_tracker_name, init_kwargs=init_kwargs
+            )
 
         # function for saving/removing
         def save_model(ckpt_name, embs_list, steps, epoch_no, force_sync_upload=False):
@@ -504,7 +516,10 @@ class TextualInversionTrainer:
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
             accelerator.print(f"\nsaving checkpoint: {ckpt_file}")
-            self.save_weights(ckpt_file, embs_list, save_dtype)
+
+            sai_metadata = train_util.get_sai_model_spec(None, args, self.is_sdxl, False, True)
+
+            self.save_weights(ckpt_file, embs_list, save_dtype, sai_metadata)
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -566,6 +581,10 @@ class TextualInversionTrainer:
                         loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
                     if args.scale_v_pred_loss_like_noise_pred:
                         loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+                    if args.v_pred_like_loss:
+                        loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+                    if args.debiased_estimation_loss:
+                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 

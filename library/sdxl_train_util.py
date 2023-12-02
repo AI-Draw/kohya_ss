@@ -4,6 +4,7 @@ import math
 import os
 from typing import Optional
 import torch
+from accelerate import init_empty_weights
 from tqdm import tqdm
 from transformers import CLIPTokenizer
 from library import model_util, sdxl_model_util, train_util, sdxl_original_unet
@@ -12,11 +13,12 @@ from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeigh
 TOKENIZER1_PATH = "openai/clip-vit-large-patch14"
 TOKENIZER2_PATH = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 
-DEFAULT_NOISE_OFFSET = 0.0357
+# DEFAULT_NOISE_OFFSET = 0.0357
 
 
 def load_target_model(args, accelerator, model_version: str, weight_dtype):
     # load models for each process
+    model_dtype = match_mixed_precision(args, weight_dtype)  # prepare fp16/bf16
     for pi in range(accelerator.state.num_processes):
         if pi == accelerator.state.local_process_index:
             print(f"loading model for process {accelerator.state.local_process_index}/{accelerator.state.num_processes}")
@@ -35,6 +37,7 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
                 model_version,
                 weight_dtype,
                 accelerator.device if args.lowram else "cpu",
+                model_dtype,
             )
 
             # work on low-ram device
@@ -53,7 +56,10 @@ def load_target_model(args, accelerator, model_version: str, weight_dtype):
     return load_stable_diffusion_format, text_encoder1, text_encoder2, vae, unet, logit_scale, ckpt_info
 
 
-def _load_target_model(name_or_path: str, vae_path: Optional[str], model_version: str, weight_dtype, device="cpu"):
+def _load_target_model(
+    name_or_path: str, vae_path: Optional[str], model_version: str, weight_dtype, device="cpu", model_dtype=None
+):
+    # model_dtype only work with full fp16/bf16
     name_or_path = os.readlink(name_or_path) if os.path.islink(name_or_path) else name_or_path
     load_stable_diffusion_format = os.path.isfile(name_or_path)  # determine SD or Diffusers
 
@@ -66,7 +72,7 @@ def _load_target_model(name_or_path: str, vae_path: Optional[str], model_version
             unet,
             logit_scale,
             ckpt_info,
-        ) = sdxl_model_util.load_models_from_sdxl_checkpoint(model_version, name_or_path, device)
+        ) = sdxl_model_util.load_models_from_sdxl_checkpoint(model_version, name_or_path, device, model_dtype)
     else:
         # Diffusers model is loaded to CPU
         from diffusers import StableDiffusionXLPipeline
@@ -75,7 +81,9 @@ def _load_target_model(name_or_path: str, vae_path: Optional[str], model_version
         print(f"load Diffusers pretrained models: {name_or_path}, variant={variant}")
         try:
             try:
-                pipe = StableDiffusionXLPipeline.from_pretrained(name_or_path, variant=variant, tokenizer=None)
+                pipe = StableDiffusionXLPipeline.from_pretrained(
+                    name_or_path, torch_dtype=model_dtype, variant=variant, tokenizer=None
+                )
             except EnvironmentError as ex:
                 if variant is not None:
                     print("try to load fp32 model")
@@ -90,15 +98,22 @@ def _load_target_model(name_or_path: str, vae_path: Optional[str], model_version
 
         text_encoder1 = pipe.text_encoder
         text_encoder2 = pipe.text_encoder_2
+
+        # convert to fp32 for cache text_encoders outputs
+        if text_encoder1.dtype != torch.float32:
+            text_encoder1 = text_encoder1.to(dtype=torch.float32)
+        if text_encoder2.dtype != torch.float32:
+            text_encoder2 = text_encoder2.to(dtype=torch.float32)
+
         vae = pipe.vae
         unet = pipe.unet
         del pipe
 
         # Diffusers U-Net to original U-Net
-        original_unet = sdxl_original_unet.SdxlUNet2DConditionModel()
         state_dict = sdxl_model_util.convert_diffusers_unet_state_dict_to_sdxl(unet.state_dict())
-        original_unet.load_state_dict(state_dict)
-        unet = original_unet
+        with init_empty_weights():
+            unet = sdxl_original_unet.SdxlUNet2DConditionModel()  # overwrite unet
+        sdxl_model_util._load_state_dict_on_device(unet, state_dict, device=device, dtype=model_dtype)
         print("U-Net converted to original U-Net")
 
         logit_scale = None
@@ -141,6 +156,21 @@ def load_tokenizers(args: argparse.Namespace):
         print(f"update token length: {args.max_token_length}")
 
     return tokeniers
+
+
+def match_mixed_precision(args, weight_dtype):
+    if args.full_fp16:
+        assert (
+            weight_dtype == torch.float16
+        ), "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
+        return weight_dtype
+    elif args.full_bf16:
+        assert (
+            weight_dtype == torch.bfloat16
+        ), "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
+        return weight_dtype
+    else:
+        return None
 
 
 def timestep_embedding(timesteps, dim, max_period=10000):
@@ -196,6 +226,7 @@ def save_sd_model_on_train_end(
     ckpt_info,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
+        sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
         sdxl_model_util.save_stable_diffusion_checkpoint(
             ckpt_file,
             text_encoder1,
@@ -206,6 +237,7 @@ def save_sd_model_on_train_end(
             ckpt_info,
             vae,
             logit_scale,
+            sai_metadata,
             save_dtype,
         )
 
@@ -247,6 +279,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
     ckpt_info,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
+        sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
         sdxl_model_util.save_stable_diffusion_checkpoint(
             ckpt_file,
             text_encoder1,
@@ -257,6 +290,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
             ckpt_info,
             vae,
             logit_scale,
+            sai_metadata,
             save_dtype,
         )
 
@@ -286,54 +320,6 @@ def save_sd_model_on_epoch_end_or_stepwise(
     )
 
 
-# TextEncoderの出力をキャッシュする
-# weight_dtypeを指定するとText Encoderそのもの、およひ出力がweight_dtypeになる
-def cache_text_encoder_outputs(args, accelerator, tokenizers, text_encoders, dataset, weight_dtype):
-    print("caching text encoder outputs")
-
-    tokenizer1, tokenizer2 = tokenizers
-    text_encoder1, text_encoder2 = text_encoders
-    text_encoder1.to(accelerator.device)
-    text_encoder2.to(accelerator.device)
-    if weight_dtype is not None:
-        text_encoder1.to(dtype=weight_dtype)
-        text_encoder2.to(dtype=weight_dtype)
-
-    text_encoder1_cache = {}
-    text_encoder2_cache = {}
-    for batch in tqdm(dataset):
-        input_ids1_batch = batch["input_ids"].to(accelerator.device)
-        input_ids2_batch = batch["input_ids2"].to(accelerator.device)
-
-        # split batch to avoid OOM
-        # TODO specify batch size by args
-        for input_id1, input_id2 in zip(input_ids1_batch.split(1), input_ids2_batch.split(1)):
-            # remove input_ids already in cache
-            input_id1_cache_key = tuple(input_id1.flatten().tolist())
-            input_id2_cache_key = tuple(input_id2.flatten().tolist())
-            if input_id1_cache_key in text_encoder1_cache:
-                assert input_id2_cache_key in text_encoder2_cache
-                continue
-
-            with torch.no_grad():
-                encoder_hidden_states1, encoder_hidden_states2, pool2 = get_hidden_states(
-                    args,
-                    input_id1,
-                    input_id2,
-                    tokenizer1,
-                    tokenizer2,
-                    text_encoder1,
-                    text_encoder2,
-                    None if not args.full_fp16 else weight_dtype,
-                )
-            encoder_hidden_states1 = encoder_hidden_states1.detach().to("cpu").squeeze(0)  # n*75+2,768
-            encoder_hidden_states2 = encoder_hidden_states2.detach().to("cpu").squeeze(0)  # n*75+2,1280
-            pool2 = pool2.detach().to("cpu").squeeze(0)  # 1280
-            text_encoder1_cache[input_id1_cache_key] = encoder_hidden_states1
-            text_encoder2_cache[input_id2_cache_key] = (encoder_hidden_states2, pool2)
-    return text_encoder1_cache, text_encoder2_cache
-
-
 def add_sdxl_training_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--cache_text_encoder_outputs", action="store_true", help="cache text encoder outputs / text encoderの出力をキャッシュする"
@@ -353,18 +339,18 @@ def verify_sdxl_training_args(args: argparse.Namespace, supportTextEncoderCachin
     if args.clip_skip is not None:
         print("clip_skip will be unexpected / SDXL学習ではclip_skipは動作しません")
 
-    if args.multires_noise_iterations:
-        print(
-            f"Warning: SDXL has been trained with noise_offset={DEFAULT_NOISE_OFFSET}, but noise_offset is disabled due to multires_noise_iterations / SDXLはnoise_offset={DEFAULT_NOISE_OFFSET}で学習されていますが、multires_noise_iterationsが有効になっているためnoise_offsetは無効になります"
-        )
-    else:
-        if args.noise_offset is None:
-            args.noise_offset = DEFAULT_NOISE_OFFSET
-        elif args.noise_offset != DEFAULT_NOISE_OFFSET:
-            print(
-                f"Warning: SDXL has been trained with noise_offset={DEFAULT_NOISE_OFFSET} / SDXLはnoise_offset={DEFAULT_NOISE_OFFSET}で学習されています"
-            )
-        print(f"noise_offset is set to {args.noise_offset} / noise_offsetが{args.noise_offset}に設定されました")
+    # if args.multires_noise_iterations:
+    #     print(
+    #         f"Warning: SDXL has been trained with noise_offset={DEFAULT_NOISE_OFFSET}, but noise_offset is disabled due to multires_noise_iterations / SDXLはnoise_offset={DEFAULT_NOISE_OFFSET}で学習されていますが、multires_noise_iterationsが有効になっているためnoise_offsetは無効になります"
+    #     )
+    # else:
+    #     if args.noise_offset is None:
+    #         args.noise_offset = DEFAULT_NOISE_OFFSET
+    #     elif args.noise_offset != DEFAULT_NOISE_OFFSET:
+    #         print(
+    #             f"Warning: SDXL has been trained with noise_offset={DEFAULT_NOISE_OFFSET} / SDXLはnoise_offset={DEFAULT_NOISE_OFFSET}で学習されています"
+    #         )
+    #     print(f"noise_offset is set to {args.noise_offset} / noise_offsetが{args.noise_offset}に設定されました")
 
     assert (
         not hasattr(args, "weighted_captions") or not args.weighted_captions

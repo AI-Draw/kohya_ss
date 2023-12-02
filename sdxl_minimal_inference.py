@@ -9,6 +9,13 @@ import random
 from einops import repeat
 import numpy as np
 import torch
+try:
+    import intel_extension_for_pytorch as ipex
+    if torch.xpu.is_available():
+        from library.ipex import ipex_init
+        ipex_init()
+except Exception:
+    pass
 from tqdm import tqdm
 from transformers import CLIPTokenizer
 from diffusers import EulerDiscreteScheduler
@@ -94,7 +101,7 @@ if __name__ == "__main__":
         type=str,
         nargs="*",
         default=[],
-        help="LoRA weights, only supports networks.lora, each arguement is a `path;multiplier` (semi-colon separated)",
+        help="LoRA weights, only supports networks.lora, each argument is a `path;multiplier` (semi-colon separated)",
     )
     parser.add_argument("--interactive", action="store_true")
     args = parser.parse_args()
@@ -112,7 +119,7 @@ if __name__ == "__main__":
     # 本体RAMが少ない場合はGPUにロードするといいかも
     # If the main RAM is small, it may be better to load it on the GPU
     text_model1, text_model2, vae, unet, _, _ = sdxl_model_util.load_models_from_sdxl_checkpoint(
-        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V0_9, args.ckpt_path, "cpu"
+        sdxl_model_util.MODEL_VERSION_SDXL_BASE_V1_0, args.ckpt_path, "cpu"
     )
 
     # Text Encoder 1はSDXL本体でもHuggingFaceのものを使っている
@@ -213,7 +220,7 @@ if __name__ == "__main__":
                 enc_out = text_model2(tokens, output_hidden_states=True, return_dict=True)
                 text_embedding2_penu = enc_out["hidden_states"][-2]
                 # print("hidden_states2", text_embedding2_penu.shape)
-                text_embedding2_pool = enc_out["text_embeds"]
+                text_embedding2_pool = enc_out["text_embeds"]   # do not support Textual Inversion
 
             # 連結して終了 concat and finish
             text_embedding = torch.cat([text_embedding1, text_embedding2_penu], dim=2)
